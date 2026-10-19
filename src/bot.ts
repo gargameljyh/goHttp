@@ -7,7 +7,8 @@ import {
 } from '@snowluma/sdk';
 import type { JsonValue, OneBotMessageEvent } from '@snowluma/sdk/types';
 import type { AppConfig } from './config.js';
-import { GlmClient } from './glm.js';
+import { GlmClient, type GlmUsage } from './glm.js';
+import { extractMemories, MemoryStore, type MemoryEntry, type MemoryRefs } from './memory.js';
 import { SessionStore } from './session.js';
 
 interface SegmentLike {
@@ -51,10 +52,42 @@ export function promptWhenAtBot(message: JsonValue, selfId: number): string | nu
   return segmentsToText(segments);
 }
 
+function cachePercent(cached: number, prompt: number): number {
+  return prompt > 0 ? Math.round((cached / prompt) * 100) : 0;
+}
+
+function logUsage(usage: GlmUsage | undefined): void {
+  if (!usage || usage.promptTokens === 0) {
+    return;
+  }
+  console.log(
+    `[glm] 输入 ${usage.promptTokens} tok｜缓存命中 ${usage.cachedTokens} tok（${cachePercent(usage.cachedTokens, usage.promptTokens)}%）`,
+  );
+}
+
 function conversationKeyOf(event: OneBotMessageEvent): string {
   return event.message_type === 'group'
     ? `group:${(event as { group_id?: number }).group_id}`
     : `private:${event.user_id}`;
+}
+
+function refsOf(event: OneBotMessageEvent): MemoryRefs {
+  return {
+    userRef: event.user_id,
+    groupRef: event.message_type === 'group' ? (event as { group_id?: number }).group_id ?? null : null,
+  };
+}
+
+/** 把检索到的记忆格式化后追加到 system prompt */
+function withMemory(systemPrompt: string, memories: readonly MemoryEntry[]): string {
+  if (memories.length === 0) {
+    return systemPrompt;
+  }
+  const lines = memories.map(
+    (memory) =>
+      `- ${memory.createdAt.slice(0, 10)} ${memory.scope === 'user' ? '关于用户' : '群记忆'}: ${memory.content}`,
+  );
+  return `${systemPrompt}\n\n## 长期记忆（自然地运用这些记忆，不要生硬罗列或复述）\n${lines.join('\n')}`;
 }
 
 function delay(ms: number): Promise<void> {
@@ -64,6 +97,9 @@ function delay(ms: number): Promise<void> {
 export async function runBot(config: AppConfig): Promise<void> {
   const glm = new GlmClient(config.glm);
   const sessions = new SessionStore(config.historyLimit);
+  const memoryStore = config.memory.enabled ? new MemoryStore(config.memory) : null;
+  /** 每个会话积累待提取的对话轮次；busy 防止提取任务重叠 */
+  const pendingExtractions = new Map<string, { exchanges: Array<{ user: string; assistant: string }>; busy: boolean }>();
 
   const bot = new SnowLumaWebSocketClient({
     url: config.snowluma.wsUrl,
@@ -74,27 +110,70 @@ export async function runBot(config: AppConfig): Promise<void> {
 
   let selfId: number | null = null;
 
+  function scheduleExtraction(conversationKey: string, refs: MemoryRefs, exchange: { user: string; assistant: string }): void {
+    if (!memoryStore) {
+      return;
+    }
+    const state = pendingExtractions.get(conversationKey) ?? { exchanges: [], busy: false };
+    state.exchanges.push(exchange);
+    pendingExtractions.set(conversationKey, state);
+    if (state.busy || state.exchanges.length < config.memory.extractEvery) {
+      return;
+    }
+    const batch = state.exchanges.splice(0, state.exchanges.length);
+    state.busy = true;
+    extractMemories(glm, batch, refs)
+      .then((items) => {
+        let added = 0;
+        for (const item of items) {
+          const ref = item.scope === 'group' ? refs.groupRef : refs.userRef;
+          if (ref !== null && memoryStore.add(item.scope, ref, item.content)) {
+            added += 1;
+          }
+        }
+        if (added > 0) {
+          console.log(`[memory] ${conversationKey} 新增 ${added} 条记忆`);
+        }
+      })
+      .catch((error) => {
+        console.warn('[memory] 提取失败:', error instanceof Error ? error.message : error);
+      })
+      .finally(() => {
+        state.busy = false;
+      });
+  }
+
   async function answer(
     ctx: SnowLumaEventContext<OneBotMessageEvent>,
     conversationKey: string,
     prompt: string,
     senderId: number,
     mentionSender: boolean,
+    refs: MemoryRefs,
   ): Promise<void> {
     if (!config.glm.apiKey) {
       await ctx.reply(text('还没有配置 GLM_API_KEY，无法调用大模型'));
       return;
     }
 
+    const systemPrompt = memoryStore
+      ? withMemory(
+          config.glm.systemPrompt,
+          memoryStore.search(prompt, refs, config.memory.injectLimit),
+        )
+      : config.glm.systemPrompt;
+
     try {
       const reply = await glm.chat([
-        { role: 'system', content: config.glm.systemPrompt },
+        { role: 'system', content: systemPrompt },
         ...sessions.list(conversationKey),
         { role: 'user', content: prompt },
       ]);
       sessions.append(conversationKey, { role: 'user', content: prompt });
       sessions.append(conversationKey, { role: 'assistant', content: reply });
       console.log(`[bot] ${conversationKey} <- ${reply.slice(0, 120)}`);
+      logUsage(glm.lastUsage);
+      scheduleExtraction(conversationKey, refs, { user: prompt, assistant: reply });
       await ctx.reply(mentionSender ? at(senderId).text(` ${reply}`) : text(reply));
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -115,7 +194,7 @@ export async function runBot(config: AppConfig): Promise<void> {
     if (!prompt) {
       return;
     }
-    await answer(ctx, `group:${event.group_id}`, prompt, event.user_id, true);
+    await answer(ctx, `group:${event.group_id}`, prompt, event.user_id, true, refsOf(event));
   });
 
   // 私聊：所有文本消息都交给 GLM
@@ -127,7 +206,7 @@ export async function runBot(config: AppConfig): Promise<void> {
     if (!prompt) {
       return;
     }
-    await answer(ctx, `private:${event.user_id}`, prompt, event.user_id, false);
+    await answer(ctx, `private:${event.user_id}`, prompt, event.user_id, false, refsOf(event));
   });
 
   // 命令：/ai <问题>，群聊私聊通用
@@ -145,7 +224,63 @@ export async function runBot(config: AppConfig): Promise<void> {
       match.rest,
       event.user_id,
       event.message_type === 'group',
+      refsOf(event),
     );
+  });
+
+  // 命令：/remember <内容>，手动为说话人记一条记忆
+  bot.command('remember', async (event, ctx, match) => {
+    if (event.post_type === 'message_sent' || event.user_id === selfId) {
+      return;
+    }
+    if (!memoryStore) {
+      await ctx.reply(text('记忆系统未启用（MEMORY_ENABLED=false）'));
+      return;
+    }
+    if (!match.rest) {
+      await ctx.reply(text('用法：/remember <要记住的内容>'));
+      return;
+    }
+    memoryStore.add('user', event.user_id, match.rest);
+    console.log(`[memory] 手动记忆 user:${event.user_id} <- ${match.rest.slice(0, 80)}`);
+    await ctx.reply(text('嗯，我记住了。'));
+  });
+
+  // 命令：/forget <关键词>，删除当前对话范围内匹配的记忆
+  bot.command('forget', async (event, ctx, match) => {
+    if (event.post_type === 'message_sent' || event.user_id === selfId) {
+      return;
+    }
+    if (!memoryStore) {
+      await ctx.reply(text('记忆系统未启用（MEMORY_ENABLED=false）'));
+      return;
+    }
+    if (!match.rest) {
+      await ctx.reply(text('用法：/forget <关键词>'));
+      return;
+    }
+    const removed = memoryStore.removeMatching(match.rest, refsOf(event));
+    await ctx.reply(text(removed > 0 ? `已经忘掉 ${removed} 条相关记忆` : '没有找到相关记忆'));
+  });
+
+  // 命令：/memories，查看当前对话范围内的记忆
+  bot.command('memories', async (event, ctx) => {
+    if (event.post_type === 'message_sent' || event.user_id === selfId) {
+      return;
+    }
+    if (!memoryStore) {
+      await ctx.reply(text('记忆系统未启用（MEMORY_ENABLED=false）'));
+      return;
+    }
+    const memories = memoryStore.list(refsOf(event));
+    if (memories.length === 0) {
+      await ctx.reply(text('关于这边，我暂时还没有记住什么'));
+      return;
+    }
+    const lines = memories.map(
+      (memory, index) => `${index + 1}. ${memory.scope === 'user' ? '关于用户' : '群记忆'}: ${memory.content}`,
+    );
+    await ctx.reply(text(`我记住的（最近用过的在前）：\n${lines.join('\n')}`));
   });
 
   bot.on('open', () => {
@@ -178,6 +313,12 @@ export async function runBot(config: AppConfig): Promise<void> {
   }
 
   const shutdown = () => {
+    const stats = glm.getStats();
+    if (stats.requests > 0) {
+      console.log(
+        `[glm] 累计 ${stats.requests} 次调用：输入 ${stats.promptTokens} tok，缓存命中 ${stats.cachedTokens} tok（${cachePercent(stats.cachedTokens, stats.promptTokens)}%），输出 ${stats.completionTokens} tok`,
+      );
+    }
     console.log('[bot] 正在退出');
     bot.close();
     process.exit(0);
