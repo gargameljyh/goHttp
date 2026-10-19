@@ -1,9 +1,0 @@
-[2022-09-15 09:52:01] [ERROR]: Protocol -> unexpected disconnect: write tcp 10.168.100.96:62892->183.47.106.14:8080: wsasend: An existing connection was forcibly closed by the remote host. 
-[2022-09-15 11:32:12] [WARNING]: Protocol -> device lock is disable. http api may fail. 
-[2022-09-15 11:50:40] [WARNING]: Protocol -> device lock is disable. http api may fail. 
-[2022-09-15 13:43:28] [ERROR]: Protocol -> unexpected disconnect: read tcp 10.168.100.96:59744->183.47.102.62:8080: wsarecv: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. 
-[2022-09-15 15:16:30] [WARNING]: Protocol -> device lock is disable. http api may fail. 
-[2022-09-15 15:16:33] [WARNING]: 正向 Websocket 使用了过时的配置格式，请更新配置文件 
-[2022-09-15 16:34:16] [WARNING]: Protocol -> device lock is disable. http api may fail. 
-[2022-09-15 16:34:18] [WARNING]: 正向 Websocket 使用了过时的配置格式，请更新配置文件 
-[2022-09-15 17:05:07] [WARNING]: 撤回 -1698611717 失败: recall error: 1001 msg: No message meets the requirements 
