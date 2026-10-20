@@ -7,7 +7,7 @@ import {
 } from '@snowluma/sdk';
 import type { JsonValue, OneBotMessageEvent } from '@snowluma/sdk/types';
 import type { AppConfig } from './config.js';
-import { GlmClient, type GlmUsage } from './glm.js';
+import { createLlmClient, type LlmUsage } from './llm/index.js';
 import { extractMemories, MemoryStore, type MemoryEntry, type MemoryRefs } from './memory.js';
 import { SessionStore } from './session.js';
 
@@ -56,12 +56,12 @@ function cachePercent(cached: number, prompt: number): number {
   return prompt > 0 ? Math.round((cached / prompt) * 100) : 0;
 }
 
-function logUsage(usage: GlmUsage | undefined): void {
+function logUsage(usage: LlmUsage | undefined): void {
   if (!usage || usage.promptTokens === 0) {
     return;
   }
   console.log(
-    `[glm] 输入 ${usage.promptTokens} tok｜缓存命中 ${usage.cachedTokens} tok（${cachePercent(usage.cachedTokens, usage.promptTokens)}%）`,
+    `[llm] 输入 ${usage.promptTokens} tok｜缓存命中 ${usage.cachedTokens} tok（${cachePercent(usage.cachedTokens, usage.promptTokens)}%）`,
   );
 }
 
@@ -95,7 +95,7 @@ function delay(ms: number): Promise<void> {
 }
 
 export async function runBot(config: AppConfig): Promise<void> {
-  const glm = new GlmClient(config.glm);
+  const llm = createLlmClient(config.llm);
   const sessions = new SessionStore(config.historyLimit);
   const memoryStore = config.memory.enabled ? new MemoryStore(config.memory) : null;
   /** 每个会话积累待提取的对话轮次；busy 防止提取任务重叠 */
@@ -122,7 +122,7 @@ export async function runBot(config: AppConfig): Promise<void> {
     }
     const batch = state.exchanges.splice(0, state.exchanges.length);
     state.busy = true;
-    extractMemories(glm, batch, refs)
+    extractMemories(llm, batch, refs)
       .then((items) => {
         let added = 0;
         for (const item of items) {
@@ -151,20 +151,20 @@ export async function runBot(config: AppConfig): Promise<void> {
     mentionSender: boolean,
     refs: MemoryRefs,
   ): Promise<void> {
-    if (!config.glm.apiKey) {
-      await ctx.reply(text('还没有配置 GLM_API_KEY，无法调用大模型'));
+    if (!config.llm.apiKey) {
+      await ctx.reply(text('还没有配置 LLM_API_KEY，无法调用大模型'));
       return;
     }
 
     const systemPrompt = memoryStore
       ? withMemory(
-          config.glm.systemPrompt,
+          config.llm.systemPrompt,
           memoryStore.search(prompt, refs, config.memory.injectLimit),
         )
-      : config.glm.systemPrompt;
+      : config.llm.systemPrompt;
 
     try {
-      const reply = await glm.chat([
+      const reply = await llm.chat([
         { role: 'system', content: systemPrompt },
         ...sessions.list(conversationKey),
         { role: 'user', content: prompt },
@@ -172,12 +172,12 @@ export async function runBot(config: AppConfig): Promise<void> {
       sessions.append(conversationKey, { role: 'user', content: prompt });
       sessions.append(conversationKey, { role: 'assistant', content: reply });
       console.log(`[bot] ${conversationKey} <- ${reply.slice(0, 120)}`);
-      logUsage(glm.lastUsage);
+      logUsage(llm.lastUsage);
       scheduleExtraction(conversationKey, refs, { user: prompt, assistant: reply });
       await ctx.reply(mentionSender ? at(senderId).text(` ${reply}`) : text(reply));
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      console.error(`[bot] GLM 调用失败 (${conversationKey}):`, reason);
+      console.error(`[bot] LLM 调用失败 (${conversationKey}):`, reason);
       const notice = `AI 调用失败：${reason.slice(0, 200)}`;
       await ctx
         .reply(mentionSender ? at(senderId).text(` ${notice}`) : text(notice))
@@ -313,10 +313,10 @@ export async function runBot(config: AppConfig): Promise<void> {
   }
 
   const shutdown = () => {
-    const stats = glm.getStats();
+    const stats = llm.getStats();
     if (stats.requests > 0) {
       console.log(
-        `[glm] 累计 ${stats.requests} 次调用：输入 ${stats.promptTokens} tok，缓存命中 ${stats.cachedTokens} tok（${cachePercent(stats.cachedTokens, stats.promptTokens)}%），输出 ${stats.completionTokens} tok`,
+        `[llm] 累计 ${stats.requests} 次调用：输入 ${stats.promptTokens} tok，缓存命中 ${stats.cachedTokens} tok（${cachePercent(stats.cachedTokens, stats.promptTokens)}%），输出 ${stats.completionTokens} tok`,
       );
     }
     console.log('[bot] 正在退出');

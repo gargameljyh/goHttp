@@ -5,8 +5,13 @@ try {
   // 没有 .env 文件，直接使用环境变量
 }
 
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveProvider, PROVIDER_PRESETS, type LlmProtocol } from './llm/index.js';
+
+/** 包根目录：源码运行（src/）与编译运行（dist/）都向上两级即项目根 */
+const PACKAGE_ROOT = dirname(fileURLToPath(new URL('../../', import.meta.url)));
 
 export interface AppConfig {
   snowluma: {
@@ -14,11 +19,15 @@ export interface AppConfig {
     accessToken: string | undefined;
     requestTimeoutMs: number;
   };
-  glm: {
+  llm: {
+    provider: string;
+    protocol: LlmProtocol;
     apiKey: string;
     baseUrl: string;
     model: string;
     timeoutMs: number;
+    /** 单次响应最大输出 token（Anthropic 协议必填） */
+    maxTokens: number;
     systemPrompt: string;
   };
   /** 每个会话保留的历史消息条数 */
@@ -53,9 +62,11 @@ const QQ_SCENE_SUFFIX = `
 
 /** 优先级：BOT_PERSONA_FILE > BOT_SYSTEM_PROMPT > 内置默认 */
 function loadSystemPrompt(): string {
-  const personaFile = process.env.BOT_PERSONA_FILE;
+  const personaFile = process.env.BOT_PERSONA_FILE?.trim();
   if (personaFile) {
-    const fullPath = resolve(process.cwd(), personaFile);
+    // 先按当前工作目录解析（支持外部角色卡），找不到再回退到包内自带角色卡
+    const cwdPath = resolve(process.cwd(), personaFile);
+    const fullPath = existsSync(cwdPath) ? cwdPath : resolve(PACKAGE_ROOT, personaFile);
     try {
       return readFileSync(fullPath, 'utf8').trim() + QQ_SCENE_SUFFIX;
     } catch {
@@ -76,12 +87,46 @@ function intEnv(name: string, fallback: number, min: number): number {
   return value;
 }
 
-export function loadConfig(): AppConfig {
-  const apiKey = process.env.GLM_API_KEY ?? '';
-  if (!apiKey) {
-    console.warn('[config] 未设置 GLM_API_KEY，收到提问时将无法调用大模型');
+/** 读取环境变量；空白值视为未设置（避免 .env 里的空串覆盖预设） */
+function envValue(name: string): string | undefined {
+  const value = process.env[name];
+  return value && value.trim().length > 0 ? value : undefined;
+}
+
+/**
+ * 解析 LLM 配置。
+ * 变量：LLM_PROVIDER / LLM_API_KEY / LLM_BASE_URL / LLM_MODEL / LLM_TIMEOUT_MS / LLM_MAX_TOKENS
+ */
+function loadLlmConfig(): AppConfig['llm'] {
+  const preset = resolveProvider(envValue('LLM_PROVIDER') ?? 'glm');
+
+  const baseUrl = envValue('LLM_BASE_URL') ?? preset.baseUrl;
+  if (!baseUrl) {
+    const known = Object.keys(PROVIDER_PRESETS).join('、');
+    throw new Error(
+      `LLM_PROVIDER=${preset.provider} 不是内置厂商（${known}），必须额外设置 LLM_BASE_URL 指定其 OpenAI 兼容接口地址`,
+    );
   }
 
+  const model = envValue('LLM_MODEL') ?? preset.model;
+  const apiKey = envValue('LLM_API_KEY') ?? '';
+  if (!apiKey) {
+    console.warn(`[config] 未设置 LLM_API_KEY（厂商 ${preset.provider}），收到提问时将无法调用大模型`);
+  }
+
+  return {
+    provider: preset.provider,
+    protocol: preset.protocol,
+    apiKey,
+    baseUrl,
+    model,
+    timeoutMs: intEnv('LLM_TIMEOUT_MS', 60_000, 1_000),
+    maxTokens: intEnv('LLM_MAX_TOKENS', 2_048, 1),
+    systemPrompt: loadSystemPrompt(),
+  };
+}
+
+export function loadConfig(): AppConfig {
   const historyLimit = Number(process.env.HISTORY_LIMIT ?? 20);
   if (!Number.isInteger(historyLimit) || historyLimit < 2) {
     throw new Error('HISTORY_LIMIT 必须是不小于 2 的整数');
@@ -93,13 +138,7 @@ export function loadConfig(): AppConfig {
       accessToken: process.env.SNOWLUMA_TOKEN || undefined,
       requestTimeoutMs: 30_000,
     },
-    glm: {
-      apiKey,
-      baseUrl: process.env.GLM_BASE_URL ?? 'https://open.bigmodel.cn/api/paas/v4',
-      model: process.env.GLM_MODEL ?? 'glm-4-flash',
-      timeoutMs: 60_000,
-      systemPrompt: loadSystemPrompt(),
-    },
+    llm: loadLlmConfig(),
     historyLimit,
     memory: {
       enabled: process.env.MEMORY_ENABLED !== 'false',

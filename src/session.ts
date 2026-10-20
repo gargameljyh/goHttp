@@ -1,4 +1,4 @@
-import type { ChatMessage } from './glm.js';
+import type { ChatMessage } from './llm/index.js';
 
 /** 按会话 key（group:<id> / private:<id>）在内存中维护对话历史 */
 export class SessionStore {

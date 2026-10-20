@@ -1,7 +1,7 @@
 import assert from 'node:assert';
 import { rmSync } from 'node:fs';
 import { loadConfig } from '../src/config.ts';
-import { GlmClient } from '../src/glm.ts';
+import { createLlmClient } from '../src/llm/index.ts';
 import {
   MemoryStore,
   parseExtracted,
@@ -57,11 +57,11 @@ assert.deepEqual(parseExtracted('前置废话 [{"scope":"group","content":"群�
 assert.deepEqual(parseExtracted('完全不是 JSON', refs), []);
 console.log('解析测试全部通过 ✓');
 
-// ── 真实 GLM 提取 ──
+// ── 真实 LLM 提取 ──
 const config = loadConfig();
-const glm = new GlmClient(config.glm);
+const llm = createLlmClient(config.llm);
 const extracted = await extractMemories(
-  glm,
+  llm,
   [
     { user: '我叫小萤，最喜欢吃橡木蛋糕卷了', assistant: '嘿嘿，橡木蛋糕卷确实很好吃呢' },
     { user: '对了，我下周三有钢琴考级，好紧张', assistant: '我会为你加油的…一定没问题的' },

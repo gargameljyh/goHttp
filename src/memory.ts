@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { GlmClient } from './glm.js';
+import type { LlmClient } from './llm/index.js';
 
 /** 一条长期记忆：关于某个用户（user）或某个群（group）的一句话事实 */
 export interface MemoryEntry {
@@ -217,7 +217,7 @@ export interface ExtractedMemory {
 
 /** 从一批对话轮次中提取记忆；失败时静默返回空数组，绝不影响主流程 */
 export async function extractMemories(
-  glm: GlmClient,
+  llm: LlmClient,
   exchanges: ReadonlyArray<{ user: string; assistant: string }>,
   refs: MemoryRefs,
 ): Promise<ExtractedMemory[]> {
@@ -225,7 +225,7 @@ export async function extractMemories(
     return [];
   }
   const dialogue = exchanges.map((x) => `用户: ${x.user}\n机器人: ${x.assistant}`).join('\n');
-  const raw = await glm.chat([
+  const raw = await llm.chat([
     { role: 'system', content: EXTRACT_SYSTEM_PROMPT },
     {
       role: 'user',

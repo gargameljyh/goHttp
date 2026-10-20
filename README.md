@@ -1,6 +1,6 @@
 # goHttp (TypeScript)
 
-QQ 群 AI 机器人：通过 [SnowLuma](https://github.com/SnowLuma/SnowLuma) 的 `@snowluma/sdk` 接收 QQ 消息，调用智谱 GLM 大模型生成回复并发回聊天。
+QQ 群 AI 机器人：通过 [SnowLuma](https://github.com/SnowLuma/SnowLuma) 的 `@snowluma/sdk` 接收 QQ 消息，调用大模型（GLM / DeepSeek / Kimi / 通义 / OpenAI / Grok / Claude 等）生成回复并发回聊天。
 
 > 原 Java 版（go-cqhttp + 图灵机器人）已清空，代码在 git 历史中。
 
@@ -9,17 +9,41 @@ QQ 群 AI 机器人：通过 [SnowLuma](https://github.com/SnowLuma/SnowLuma) �
 ```
 QQ ⇄ SnowLuma 运行时 (OneBot v11, ws://127.0.0.1:3001)
               ⇄ 本项目 (@snowluma/sdk WebSocket 客户端)
-                      ⇄ 智谱 GLM API (open.bigmodel.cn, OpenAI 兼容)
+                      ⇄ 任意大模型厂商（OpenAI 兼容协议或 Anthropic 协议）
 ```
 
 ```
 src/
   config.ts   环境变量 / .env 配置加载
-  glm.ts      GLM /chat/completions 客户端（原生 fetch）
+  llm/        大模型通用抽象
+    types.ts      LlmClient 接口、用量统计基类
+    openai.ts     OpenAI 兼容协议（/chat/completions，多数厂商）
+    anthropic.ts  Anthropic 原生协议（/messages）
+    index.ts      厂商预设表 + 客户端工厂
   session.ts  按会话（群/私聊）的内存对话历史
+  memory.ts   长期记忆（JSONL 持久化 + 相似度检索）
   bot.ts      SnowLuma 客户端与消息处理
-  index.ts    入口
+  patch-sdk.ts 启动时修补 @snowluma/sdk 的 ESM 导入（替代 postinstall）
+  index.ts    入口（bin）
 ```
+
+## 大模型厂商配置
+
+通过 `LLM_PROVIDER` 切换厂商，内置预设自动带默认 API 地址和默认模型：
+
+| LLM_PROVIDER | 协议 | 默认 API 地址 | 默认模型 |
+| --- | --- | --- | --- |
+| `glm` | OpenAI 兼容 | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+| `deepseek` | OpenAI 兼容 | `https://api.deepseek.com` | `deepseek-chat` |
+| `kimi` | OpenAI 兼容 | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| `qwen` | OpenAI 兼容 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| `openai` | OpenAI 兼容 | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| `grok` | OpenAI 兼容 | `https://api.x.ai/v1` | `grok-3-mini` |
+| `anthropic` | Anthropic 原生 | `https://api.anthropic.com/v1` | `claude-sonnet-4-5` |
+
+其它任意厂商（如硅基流动、OpenRouter、vLLM 自部署等）：`LLM_PROVIDER` 随便命名，按 OpenAI 兼容协议处理，但必须设置 `LLM_BASE_URL`。
+
+缓存命中统计对两类协议统一：OpenAI 兼容读 `usage.prompt_tokens_details.cached_tokens`，Anthropic 读 `usage.cache_read_input_tokens`。
 
 ## 触发方式
 
@@ -57,9 +81,12 @@ src/
 | --- | --- | --- |
 | `SNOWLUMA_WS_URL` | SnowLuma OneBot WebSocket 地址 | `ws://127.0.0.1:3001/` |
 | `SNOWLUMA_TOKEN` | SnowLuma accessToken | 空（不鉴权） |
-| `GLM_API_KEY` | 智谱开放平台 API Key，必填 | — |
-| `GLM_BASE_URL` | GLM API 地址 | `https://open.bigmodel.cn/api/paas/v4` |
-| `GLM_MODEL` | 模型名 | `glm-4-flash` |
+| `LLM_PROVIDER` | 大模型厂商，见上表 | `glm` |
+| `LLM_API_KEY` | 对应厂商 API Key，必填 | — |
+| `LLM_BASE_URL` | 覆盖默认 API 地址 | 厂商预设 |
+| `LLM_MODEL` | 模型名 | 厂商预设 |
+| `LLM_TIMEOUT_MS` | 请求超时（毫秒） | `60000` |
+| `LLM_MAX_TOKENS` | 单次最大输出 token（Anthropic 协议必填） | `2048` |
 | `BOT_SYSTEM_PROMPT` | 机器人人设 system prompt | 内置默认 |
 | `BOT_PERSONA_FILE` | 角色卡 Markdown 文件路径（相对项目根目录），设置后作为 system prompt 加载并优先生效 | 空 |
 | `HISTORY_LIMIT` | 每会话保留的历史条数 | `20` |
@@ -71,6 +98,19 @@ src/
 前提：本机需运行 SnowLuma 并已登录 QQ 账号、开启 OneBot WebSocket 连接（见 SnowLuma WebUI `http://localhost:5099`）。
 
 ## 运行
+
+**方式一：npx 直接运行**（需 Node 24+，首次会自动下载构建）
+
+```bash
+# 从 GitHub 仓库直接运行
+npx github:gargameljyh/goHttp
+# 发布到 npm 后
+npx gohttp
+```
+
+npx 场景下在**当前目录**放一份 `.env`（参考 `.env.example`）即可；`BOT_PERSONA_FILE` 角色卡路径先按当前目录解析、找不到时回退到包内自带的 `skills/`；记忆数据写在当前目录 `data/` 下。启动时会自动修补 `@snowluma/sdk` 的 ESM 导入问题，无需其它操作。
+
+**方式二：克隆安装**
 
 ```bash
 npm install
